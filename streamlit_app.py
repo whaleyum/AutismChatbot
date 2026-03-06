@@ -1,4 +1,13 @@
 import streamlit as st
+
+# MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Autism Research Chatbot",
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import torch
 import numpy as np
 import pandas as pd
@@ -16,46 +25,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
 import warnings
-import streamlit as st
-
-# MUST be the first Streamlit command
-st.set_page_config(
-    page_title="Autism Research Chatbot",
-    page_icon="🧩",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Add this to prevent automatic processing
-import os
-import sys
-
-# Check if this is the first run and there are PDFs in the directory
-if 'pdf_chunks' not in st.session_state:
-    st.session_state.pdf_chunks = []
-if 'faiss_index' not in st.session_state:
-    st.session_state.faiss_index = None
-if 'embedder' not in st.session_state:
-    st.session_state.embedder = None
-if 'model' not in st.session_state:
-    st.session_state.model = None
-if 'tokenizer' not in st.session_state:
-    st.session_state.tokenizer = None
-if 'pdf_names' not in st.session_state:
-    st.session_state.pdf_names = []
-if 'processing_complete' not in st.session_state:
-    st.session_state.processing_complete = False
-if 'models_loaded' not in st.session_state:
-    st.session_state.models_loaded = False
 warnings.filterwarnings('ignore')
-
-# Set page config FIRST (must be the first Streamlit command)
-st.set_page_config(
-    page_title="Autism Research Chatbot",
-    page_icon="🧩",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # Download NLTK data
 try:
@@ -102,6 +72,13 @@ st.markdown("""
     .stProgress > div > div > div > div {
         background-color: #4ECDC4;
     }
+    .info-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #262730;
+        border-left: 4px solid #4ECDC4;
+        margin-bottom: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -122,6 +99,8 @@ if 'pdf_names' not in st.session_state:
     st.session_state.pdf_names = []
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'models_loaded' not in st.session_state:
+    st.session_state.models_loaded = False
 
 # Constants
 REFUSAL_STRING = "I do not understand this question, and the topic you mentioned is not present in the provided PDF corpus."
@@ -141,43 +120,42 @@ def clean_text(text):
     return text
 
 @st.cache_resource
-def load_embedder():
-    """Load the sentence transformer model with caching"""
-    return SentenceTransformer('BAAI/bge-small-en-v1.5')
-
-@st.cache_resource
-def load_model():
-    """Load the Qwen model with LoRA"""
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    
-    # Set environment variable to suppress tokenizer warnings
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, 
-        trust_remote_code=True,
-        use_fast=True
-    )
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    # Load model with appropriate settings
-    if torch.cuda.is_available():
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
+def load_models():
+    """Load models only when needed"""
+    with st.spinner("Loading AI models... (this may take 2-3 minutes)"):
+        # Set environment variable to suppress tokenizer warnings
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
+        # Load embedder
+        embedder = SentenceTransformer('BAAI/bge-small-en-v1.5')
+        
+        # Load Qwen model
+        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, 
             trust_remote_code=True,
-            low_cpu_mem_usage=True
+            use_fast=True
         )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float32,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-    
-    return model, tokenizer
+        tokenizer.pad_token = tokenizer.eos_token
+        
+        if torch.cuda.is_available():
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        
+        return embedder, model, tokenizer
 
 def process_pdfs(uploaded_files):
     """Process uploaded PDF files"""
@@ -185,7 +163,11 @@ def process_pdfs(uploaded_files):
     pdf_names = []
     
     progress_bar = st.progress(0)
+    status_text = st.empty()
+    
     for i, uploaded_file in enumerate(uploaded_files):
+        status_text.text(f"Processing {uploaded_file.name}...")
+        
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
@@ -213,6 +195,7 @@ def process_pdfs(uploaded_files):
         progress_bar.progress((i + 1) / len(uploaded_files))
     
     progress_bar.empty()
+    status_text.empty()
     return pdf_documents, pdf_names
 
 def create_chunks(pdf_documents, pdf_names):
@@ -237,7 +220,7 @@ def create_chunks(pdf_documents, pdf_names):
 
 def create_faiss_index(chunks, embedder):
     """Create FAISS index from chunks"""
-    with st.spinner("Creating embeddings..."):
+    with st.spinner("Creating embeddings... (this may take a few minutes)"):
         chunk_embeddings = embedder.encode(
             chunks, 
             normalize_embeddings=True, 
@@ -404,6 +387,9 @@ with st.sidebar:
     st.header("📁 Document Upload")
     st.markdown("Upload PDF files containing autism research papers to build the knowledge base.")
     
+    # Add info about loading times
+    st.info("⏱️ **Note:** Loading models and processing PDFs may take 2-3 minutes. Please be patient.")
+    
     uploaded_files = st.file_uploader(
         "Choose PDF files",
         type=['pdf'],
@@ -412,6 +398,16 @@ with st.sidebar:
     
     if uploaded_files:
         if st.button("🔄 Process PDFs", type="primary"):
+            # Load models first if not loaded
+            if not st.session_state.models_loaded:
+                with st.spinner("Loading AI models... (this may take 2-3 minutes)"):
+                    embedder, model, tokenizer = load_models()
+                    st.session_state.embedder = embedder
+                    st.session_state.model = model
+                    st.session_state.tokenizer = tokenizer
+                    st.session_state.models_loaded = True
+                    st.success("✅ Models loaded successfully!")
+            
             with st.spinner("Processing PDFs..."):
                 # Process PDFs
                 pdf_documents, pdf_names = process_pdfs(uploaded_files)
@@ -421,23 +417,15 @@ with st.sidebar:
                     # Create chunks
                     st.session_state.pdf_chunks = create_chunks(pdf_documents, pdf_names)
                     
-                    # Load embedder
-                    st.session_state.embedder = load_embedder()
-                    
                     # Create FAISS index
                     st.session_state.faiss_index = create_faiss_index(
                         st.session_state.pdf_chunks, 
                         st.session_state.embedder
                     )
                     
-                    # Load model
-                    with st.spinner("Loading AI model... (this may take a minute)"):
-                        st.session_state.model, st.session_state.tokenizer = load_model()
-                    
                     st.session_state.processing_complete = True
                     st.success(f"✅ Processed {len(pdf_documents)} PDFs")
-                    st.success(f"✅ Created {len(st.session_state.pdf_chunks)} chunks")
-                    st.success("✅ Model loaded successfully")
+                    st.success(f"✅ Created {len(st.session_state.pdf_chunks)} knowledge chunks")
                     st.rerun()
                 else:
                     st.error("No valid PDFs could be processed")
@@ -459,10 +447,11 @@ with st.sidebar:
             st.session_state.tokenizer = None
             st.session_state.pdf_names = []
             st.session_state.processing_complete = False
+            st.session_state.models_loaded = False
             st.rerun()
 
 # Main chat interface
-if st.session_state.pdf_chunks and st.session_state.model:
+if st.session_state.pdf_chunks and st.session_state.model and st.session_state.embedder:
     # Chat input
     col1, col2 = st.columns([6, 1])
     with col1:
@@ -471,7 +460,7 @@ if st.session_state.pdf_chunks and st.session_state.model:
         show_metrics = st.checkbox("Show metrics", value=True)
     
     if user_question:
-        with st.spinner("🔍 Searching knowledge base..."):
+        with st.spinner("🔍 Searching knowledge base and generating answer..."):
             # Retrieve context
             context = retrieve_top_k_chunks(
                 user_question,
@@ -551,20 +540,21 @@ if st.session_state.pdf_chunks and st.session_state.model:
             
             # Overall score
             avg_score = sum(chat['metrics'].values()) / len(chat['metrics'])
-            st.progress(avg_score, text=f"Overall Quality: {avg_score:.2f}")
+            st.progress(avg_score, text=f"**Overall Quality:** {avg_score:.2f}")
             
             # Radar chart
-            fig = plot_metrics_radar(chat['metrics'])
-            st.pyplot(fig)
-            plt.close()
+            with st.expander("📊 View Metrics Radar Chart"):
+                fig = plot_metrics_radar(chat['metrics'])
+                st.pyplot(fig)
+                plt.close()
         
         st.divider()
 
-elif not st.session_state.pdf_chunks:
+elif st.session_state.models_loaded and not st.session_state.pdf_chunks:
     st.info("👈 Please upload and process PDF files in the sidebar to start chatting.")
     
     # Show example questions
-    st.markdown("### 📝 Example questions you can ask:")
+    st.markdown("### 📝 Example questions you can ask after uploading PDFs:")
     examples = [
         "What is autism?",
         "What are the main symptoms of autism?",
@@ -575,10 +565,26 @@ elif not st.session_state.pdf_chunks:
     for ex in examples:
         st.markdown(f"- {ex}")
 
+elif not st.session_state.models_loaded:
+    st.markdown("""
+    <div class="info-box">
+        <h3>🚀 Welcome to the Autism Research Chatbot!</h3>
+        <p>To get started:</p>
+        <ol>
+            <li>Upload PDF files containing autism research papers using the sidebar</li>
+            <li>Click "Process PDFs" to load the AI models and create your knowledge base</li>
+            <li>Start asking questions about autism based on your documents</li>
+        </ol>
+        <p><strong>Note:</strong> The first time you process PDFs, it may take 2-3 minutes to load the AI models.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666;">
     <small>⚠️ This chatbot only answers questions based on the uploaded PDFs. It will refuse to answer questions outside its knowledge base.</small>
+    <br>
+    <small>Made with ❤️ for autism research</small>
 </div>
 """, unsafe_allow_html=True)
