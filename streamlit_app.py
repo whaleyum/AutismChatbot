@@ -4,34 +4,34 @@ import numpy as np
 import pandas as pd
 import fitz  # PyMuPDF
 import faiss
-import pickle
 import os
 import tempfile
-from pathlib import Path
 import nltk
 import re
 import gc
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel, PeftConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
 import warnings
 warnings.filterwarnings('ignore')
 
-# Download NLTK data
-nltk.download('punkt', quiet=True)
-nltk.download('punkt_tab', quiet=True)
-
-# Page configuration
+# Set page config FIRST (must be the first Streamlit command)
 st.set_page_config(
     page_title="Autism Research Chatbot",
     page_icon="🧩",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Download NLTK data
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+except:
+    pass
 
 # Custom CSS
 st.markdown("""
@@ -61,18 +61,15 @@ st.markdown("""
         background-color: #1e1e1e;
         border-left: 4px solid #FFD166;
     }
-    .metric-card {
-        background-color: #262730;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        text-align: center;
-    }
     .refusal-message {
         color: #FF6B6B;
         font-style: italic;
         padding: 1rem;
         background-color: rgba(255, 107, 107, 0.1);
         border-radius: 0.5rem;
+    }
+    .stProgress > div > div > div > div {
+        background-color: #4ECDC4;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -92,6 +89,8 @@ if 'tokenizer' not in st.session_state:
     st.session_state.tokenizer = None
 if 'pdf_names' not in st.session_state:
     st.session_state.pdf_names = []
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
 
 # Constants
 REFUSAL_STRING = "I do not understand this question, and the topic you mentioned is not present in the provided PDF corpus."
@@ -110,32 +109,79 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+@st.cache_resource
+def load_embedder():
+    """Load the sentence transformer model with caching"""
+    return SentenceTransformer('BAAI/bge-small-en-v1.5')
+
+@st.cache_resource
+def load_model():
+    """Load the Qwen model with LoRA"""
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    
+    # Set environment variable to suppress tokenizer warnings
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, 
+        trust_remote_code=True,
+        use_fast=True
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load model with appropriate settings
+    if torch.cuda.is_available():
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    
+    return model, tokenizer
+
 def process_pdfs(uploaded_files):
     """Process uploaded PDF files"""
     pdf_documents = []
     pdf_names = []
     
-    for uploaded_file in uploaded_files:
+    progress_bar = st.progress(0)
+    for i, uploaded_file in enumerate(uploaded_files):
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_path = tmp_file.name
         
         # Extract text
-        doc = fitz.open(tmp_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        doc.close()
+        try:
+            doc = fitz.open(tmp_path)
+            text = ""
+            for page in doc:
+                text += page.get_text()
+            doc.close()
+            
+            # Clean text
+            cleaned_text = clean_text(text)
+            pdf_documents.append(cleaned_text)
+            pdf_names.append(uploaded_file.name)
+        except Exception as e:
+            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
         
-        # Clean text
-        cleaned_text = clean_text(text)
-        pdf_documents.append(cleaned_text)
-        pdf_names.append(uploaded_file.name)
-        
-        # Clean up temp file
-        os.unlink(tmp_path)
+        # Update progress
+        progress_bar.progress((i + 1) / len(uploaded_files))
     
+    progress_bar.empty()
     return pdf_documents, pdf_names
 
 def create_chunks(pdf_documents, pdf_names):
@@ -143,7 +189,8 @@ def create_chunks(pdf_documents, pdf_names):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=300,
-        separators=["\n\n", "\n", ". ", " ", ""]
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len
     )
     
     pdf_chunks = []
@@ -151,17 +198,24 @@ def create_chunks(pdf_documents, pdf_names):
         raw_chunks = text_splitter.split_text(doc_text)
         source_name = pdf_names[i]
         for chunk in raw_chunks:
-            contextualized_chunk = f"Source: {source_name}\nContent: {chunk}"
-            pdf_chunks.append(contextualized_chunk)
+            if len(chunk.strip()) > 50:  # Only keep meaningful chunks
+                contextualized_chunk = f"Source: {source_name}\nContent: {chunk}"
+                pdf_chunks.append(contextualized_chunk)
     
     return pdf_chunks
 
 def create_faiss_index(chunks, embedder):
     """Create FAISS index from chunks"""
-    chunk_embeddings = embedder.encode(chunks, normalize_embeddings=True, convert_to_numpy=True)
-    dimension = chunk_embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dimension)
-    faiss_index.add(chunk_embeddings)
+    with st.spinner("Creating embeddings..."):
+        chunk_embeddings = embedder.encode(
+            chunks, 
+            normalize_embeddings=True, 
+            convert_to_numpy=True,
+            show_progress_bar=True
+        )
+        dimension = chunk_embeddings.shape[1]
+        faiss_index = faiss.IndexFlatIP(dimension)
+        faiss_index.add(chunk_embeddings)
     return faiss_index
 
 def retrieve_top_k_chunks(question, embedder, faiss_index, chunks, k=5):
@@ -169,24 +223,9 @@ def retrieve_top_k_chunks(question, embedder, faiss_index, chunks, k=5):
     instruction = "Represent this sentence for searching relevant passages: "
     query_text = instruction + question
     q_emb = embedder.encode([query_text], normalize_embeddings=True, convert_to_numpy=True)
-    distances, indices = faiss_index.search(q_emb, k)
+    distances, indices = faiss_index.search(q_emb, min(k, len(chunks)))
     retrieved_chunks = [chunks[i] for i in indices[0]]
     return " ".join(retrieved_chunks)
-
-def load_model():
-    """Load the Qwen model with LoRA"""
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True
-    )
-    
-    return model, tokenizer
 
 def ask_question(question, context, model, tokenizer):
     """Generate answer using the model"""
@@ -227,71 +266,76 @@ Context:
         {"role": "user", "content": question}
     ]
     
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    if torch.cuda.is_available():
-        inputs = {k: v.cuda() for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=150,
-            temperature=0.1,
-            do_sample=True,
-            top_p=0.9,
-            num_beams=1,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
-    
-    response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
-    
-    # Safety check
-    if contains_forbidden and len(response.split()) < 15 and REFUSAL_STRING not in response:
-        if not any(sent in context for sent in response.split('.') if len(sent) > 20):
-            return REFUSAL_STRING
-    
-    return response
+    try:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.1,
+                do_sample=True,
+                top_p=0.9,
+                num_beams=1,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
+        
+        # Safety check
+        if contains_forbidden and len(response.split()) < 15 and REFUSAL_STRING not in response:
+            if not any(sent in context for sent in response.split('.') if len(sent) > 20):
+                return REFUSAL_STRING
+        
+        return response
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
 def calculate_metrics(question, answer, context, embedder, faiss_index, chunks):
     """Calculate evaluation metrics"""
     metrics = {}
     
-    # Precision@k
-    instruction = "Represent this sentence for searching relevant passages: "
-    query_text = instruction + question
-    q_emb = embedder.encode([query_text], normalize_embeddings=True, convert_to_numpy=True)
-    distances, indices = faiss_index.search(q_emb, 5)
-    retrieved_chunks = [chunks[i] for i in indices[0]]
-    
-    # Context relevancy
-    question_emb = embedder.encode([question])
-    context_emb = embedder.encode([context])
-    metrics['context_relevancy'] = float(cosine_similarity(question_emb, context_emb)[0][0])
-    
-    # Answer relevancy
-    answer_emb = embedder.encode([answer])
-    metrics['answer_relevancy'] = float(cosine_similarity(question_emb, answer_emb)[0][0])
-    
-    # Groundedness
-    metrics['groundedness'] = float(cosine_similarity(answer_emb, context_emb)[0][0])
-    
-    # Faithfulness (simplified)
-    if REFUSAL_STRING in answer:
-        metrics['faithfulness'] = 0.0
-    else:
-        answer_sentences = [s.strip() for s in re.split(r'[.!?]+', answer) if len(s.strip()) > 10]
-        context_sentences = [s.strip() for s in re.split(r'[.!?]+', context) if len(s.strip()) > 10]
+    try:
+        # Context relevancy
+        question_emb = embedder.encode([question])
+        context_emb = embedder.encode([context])
+        metrics['context_relevancy'] = float(cosine_similarity(question_emb, context_emb)[0][0])
         
-        if answer_sentences and context_sentences:
-            ans_embs = embedder.encode(answer_sentences)
-            ctx_embs = embedder.encode(context_sentences)
-            sim_matrix = cosine_similarity(ans_embs, ctx_embs)
-            supported_count = sum(1 for i in range(len(answer_sentences)) if max(sim_matrix[i]) > 0.60)
-            metrics['faithfulness'] = supported_count / len(answer_sentences)
-        else:
+        # Answer relevancy
+        answer_emb = embedder.encode([answer])
+        metrics['answer_relevancy'] = float(cosine_similarity(question_emb, answer_emb)[0][0])
+        
+        # Groundedness
+        metrics['groundedness'] = float(cosine_similarity(answer_emb, context_emb)[0][0])
+        
+        # Faithfulness (simplified)
+        if REFUSAL_STRING in answer:
             metrics['faithfulness'] = 0.0
+        else:
+            answer_sentences = [s.strip() for s in re.split(r'[.!?]+', answer) if len(s.strip()) > 10]
+            context_sentences = [s.strip() for s in re.split(r'[.!?]+', context) if len(s.strip()) > 10]
+            
+            if answer_sentences and context_sentences:
+                ans_embs = embedder.encode(answer_sentences)
+                ctx_embs = embedder.encode(context_sentences)
+                sim_matrix = cosine_similarity(ans_embs, ctx_embs)
+                supported_count = sum(1 for i in range(len(answer_sentences)) if max(sim_matrix[i]) > 0.60)
+                metrics['faithfulness'] = supported_count / len(answer_sentences)
+            else:
+                metrics['faithfulness'] = 0.0
+    except Exception as e:
+        # Default values if metrics calculation fails
+        metrics = {
+            'context_relevancy': 0.0,
+            'answer_relevancy': 0.0,
+            'groundedness': 0.0,
+            'faithfulness': 0.0
+        }
     
     return metrics
 
@@ -342,25 +386,30 @@ with st.sidebar:
                 pdf_documents, pdf_names = process_pdfs(uploaded_files)
                 st.session_state.pdf_names = pdf_names
                 
-                # Create chunks
-                st.session_state.pdf_chunks = create_chunks(pdf_documents, pdf_names)
-                
-                # Initialize embedder
-                st.session_state.embedder = SentenceTransformer('BAAI/bge-small-en-v1.5')
-                
-                # Create FAISS index
-                st.session_state.faiss_index = create_faiss_index(
-                    st.session_state.pdf_chunks, 
-                    st.session_state.embedder
-                )
-                
-                # Load model
-                with st.spinner("Loading AI model... (this may take a minute)"):
-                    st.session_state.model, st.session_state.tokenizer = load_model()
-                
-                st.success(f"✅ Processed {len(pdf_documents)} PDFs")
-                st.success(f"✅ Created {len(st.session_state.pdf_chunks)} chunks")
-                st.success("✅ Model loaded successfully")
+                if pdf_documents:
+                    # Create chunks
+                    st.session_state.pdf_chunks = create_chunks(pdf_documents, pdf_names)
+                    
+                    # Load embedder
+                    st.session_state.embedder = load_embedder()
+                    
+                    # Create FAISS index
+                    st.session_state.faiss_index = create_faiss_index(
+                        st.session_state.pdf_chunks, 
+                        st.session_state.embedder
+                    )
+                    
+                    # Load model
+                    with st.spinner("Loading AI model... (this may take a minute)"):
+                        st.session_state.model, st.session_state.tokenizer = load_model()
+                    
+                    st.session_state.processing_complete = True
+                    st.success(f"✅ Processed {len(pdf_documents)} PDFs")
+                    st.success(f"✅ Created {len(st.session_state.pdf_chunks)} chunks")
+                    st.success("✅ Model loaded successfully")
+                    st.rerun()
+                else:
+                    st.error("No valid PDFs could be processed")
     
     # Display stats
     if st.session_state.pdf_chunks:
@@ -378,6 +427,7 @@ with st.sidebar:
             st.session_state.model = None
             st.session_state.tokenizer = None
             st.session_state.pdf_names = []
+            st.session_state.processing_complete = False
             st.rerun()
 
 # Main chat interface
@@ -456,18 +506,21 @@ if st.session_state.pdf_chunks and st.session_state.model:
         
         # Display metrics if available
         if chat.get('metrics'):
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                st.metric("Context Relevancy", f"{chat['metrics']['context_relevancy']:.2f}")
-            with col2:
-                st.metric("Answer Relevancy", f"{chat['metrics']['answer_relevancy']:.2f}")
-            with col3:
-                st.metric("Groundedness", f"{chat['metrics']['groundedness']:.2f}")
-            with col4:
-                st.metric("Faithfulness", f"{chat['metrics']['faithfulness']:.2f}")
-            with col5:
-                avg_score = sum(chat['metrics'].values()) / len(chat['metrics'])
-                st.metric("Overall Quality", f"{avg_score:.2f}")
+            cols = st.columns(4)
+            metrics_display = [
+                ("Context Relevancy", chat['metrics'].get('context_relevancy', 0)),
+                ("Answer Relevancy", chat['metrics'].get('answer_relevancy', 0)),
+                ("Groundedness", chat['metrics'].get('groundedness', 0)),
+                ("Faithfulness", chat['metrics'].get('faithfulness', 0))
+            ]
+            
+            for col, (label, value) in zip(cols, metrics_display):
+                with col:
+                    st.metric(label, f"{value:.2f}")
+            
+            # Overall score
+            avg_score = sum(chat['metrics'].values()) / len(chat['metrics'])
+            st.progress(avg_score, text=f"Overall Quality: {avg_score:.2f}")
             
             # Radar chart
             fig = plot_metrics_radar(chat['metrics'])
