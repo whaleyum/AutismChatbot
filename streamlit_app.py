@@ -20,7 +20,7 @@ import re
 import gc
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
@@ -79,6 +79,13 @@ st.markdown("""
         border-left: 4px solid #4ECDC4;
         margin-bottom: 1rem;
     }
+    .warning-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #332e1d;
+        border-left: 4px solid #FFD166;
+        margin-bottom: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,6 +108,8 @@ if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 if 'models_loaded' not in st.session_state:
     st.session_state.models_loaded = False
+if 'use_small_model' not in st.session_state:
+    st.session_state.use_small_model = True  # Default to small model for cloud
 
 # Constants
 REFUSAL_STRING = "I do not understand this question, and the topic you mentioned is not present in the provided PDF corpus."
@@ -120,42 +129,63 @@ def clean_text(text):
     return text
 
 @st.cache_resource
-def load_models():
-    """Load models only when needed"""
-    with st.spinner("Loading AI models... (this may take 2-3 minutes)"):
-        # Set environment variable to suppress tokenizer warnings
+def load_embedder():
+    """Load the sentence transformer model with caching"""
+    with st.spinner("Loading embedding model..."):
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        
-        # Load embedder
-        embedder = SentenceTransformer('BAAI/bge-small-en-v1.5')
-        
-        # Load Qwen model
-        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+        return SentenceTransformer('BAAI/bge-small-en-v1.5')
+
+@st.cache_resource
+def load_small_model():
+    """Load a smaller model for cloud deployment"""
+    with st.spinner("Loading AI model (small version for cloud)..."):
+        model_name = "microsoft/phi-2"  # Smaller model (2.7B but more efficient)
         
         tokenizer = AutoTokenizer.from_pretrained(
             model_name, 
             trust_remote_code=True,
             use_fast=True
         )
-        tokenizer.pad_token = tokenizer.eos_token
         
-        if torch.cuda.is_available():
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
-        return embedder, model, tokenizer
+        # Load in 8-bit to save memory
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        
+        return model, tokenizer
+
+@st.cache_resource
+def load_tiny_model():
+    """Load a tiny model as fallback"""
+    with st.spinner("Loading tiny fallback model..."):
+        # Using a very small model as last resort
+        model_name = "microsoft/phi-1_5"  # 1.3B model
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, 
+            trust_remote_code=True,
+            use_fast=True
+        )
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        
+        return model, tokenizer
 
 def process_pdfs(uploaded_files):
     """Process uploaded PDF files"""
@@ -201,8 +231,8 @@ def process_pdfs(uploaded_files):
 def create_chunks(pdf_documents, pdf_names):
     """Split documents into chunks"""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=300,
+        chunk_size=1000,  # Smaller chunks for cloud
+        chunk_overlap=200,
         separators=["\n\n", "\n", ". ", " ", ""],
         length_function=len
     )
@@ -232,7 +262,7 @@ def create_faiss_index(chunks, embedder):
         faiss_index.add(chunk_embeddings)
     return faiss_index
 
-def retrieve_top_k_chunks(question, embedder, faiss_index, chunks, k=5):
+def retrieve_top_k_chunks(question, embedder, faiss_index, chunks, k=3):  # Reduced k for cloud
     """Retrieve top k relevant chunks for a question"""
     instruction = "Represent this sentence for searching relevant passages: "
     query_text = instruction + question
@@ -263,34 +293,29 @@ def ask_question(question, context, model, tokenizer):
     if contains_forbidden and (not context or len(context.strip()) < 100):
         return REFUSAL_STRING
     
+    # Truncate context if too long
+    if len(context) > 2000:
+        context = context[:2000] + "..."
+    
     # Format prompt
-    messages = [
-        {"role": "system", "content": f"""You are a STRICT PDF assistant. Your ONLY source of knowledge is the Context below.
-
-ABSOLUTE RULES - YOU MUST FOLLOW THESE:
-1. If the Context does NOT contain information to answer the question, you MUST respond with EXACTLY:
-   "{REFUSAL_STRING}"
-2. This includes ALL questions about topics not covered in the PDFs
-3. Do NOT use ANY outside knowledge or common sense
-4. Do NOT make up ANY information
-5. If you are unsure, ALWAYS choose the refusal message
+    prompt = f"""You are a helpful assistant that answers questions based ONLY on the provided context. If the context doesn't contain the answer, say exactly: "{REFUSAL_STRING}"
 
 Context:
-{context}"""},
-        {"role": "user", "content": question}
-    ]
+{context}
+
+Question: {question}
+
+Answer:"""
     
     try:
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=150,
+                max_new_tokens=100,
                 temperature=0.1,
                 do_sample=True,
                 top_p=0.9,
@@ -308,9 +333,9 @@ Context:
         
         return response
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        return f"I encountered an error: {str(e)}"
 
-def calculate_metrics(question, answer, context, embedder, faiss_index, chunks):
+def calculate_metrics(question, answer, context, embedder):
     """Calculate evaluation metrics"""
     metrics = {}
     
@@ -382,12 +407,30 @@ def plot_metrics_radar(metrics):
 st.markdown('<h1 class="main-header">🧩 Autism Research Chatbot</h1>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Ask questions about autism based on uploaded research PDFs</p>', unsafe_allow_html=True)
 
+# Cloud warning
+st.markdown("""
+<div class="warning-box">
+    <strong>⚠️ Cloud Deployment Notice:</strong> This app is running on Streamlit Cloud with limited resources. 
+    We're using a smaller AI model to ensure stability. For full performance, consider running locally.
+</div>
+""", unsafe_allow_html=True)
+
 # Sidebar for configuration
 with st.sidebar:
     st.header("📁 Document Upload")
     st.markdown("Upload PDF files containing autism research papers to build the knowledge base.")
     
-    # Add info about loading times
+    # Model selection
+    st.divider()
+    st.header("⚙️ Settings")
+    model_option = st.radio(
+        "Model Size (for cloud deployment)",
+        options=["Small (Recommended)", "Tiny (Fallback)"],
+        index=0,
+        help="Small model works better but uses more memory. Tiny model is more stable on limited resources."
+    )
+    st.session_state.use_small_model = (model_option == "Small (Recommended)")
+    
     st.info("⏱️ **Note:** Loading models and processing PDFs may take 2-3 minutes. Please be patient.")
     
     uploaded_files = st.file_uploader(
@@ -398,37 +441,56 @@ with st.sidebar:
     
     if uploaded_files:
         if st.button("🔄 Process PDFs", type="primary"):
-            # Load models first if not loaded
+            # Load embedder first
+            if not st.session_state.embedder:
+                st.session_state.embedder = load_embedder()
+            
+            # Load model based on selection
             if not st.session_state.models_loaded:
-                with st.spinner("Loading AI models... (this may take 2-3 minutes)"):
-                    embedder, model, tokenizer = load_models()
-                    st.session_state.embedder = embedder
+                try:
+                    if st.session_state.use_small_model:
+                        model, tokenizer = load_small_model()
+                    else:
+                        model, tokenizer = load_tiny_model()
+                    
                     st.session_state.model = model
                     st.session_state.tokenizer = tokenizer
                     st.session_state.models_loaded = True
-                    st.success("✅ Models loaded successfully!")
+                    st.success("✅ Model loaded successfully!")
+                except Exception as e:
+                    st.error(f"Failed to load model: {str(e)}")
+                    st.info("Trying tiny fallback model...")
+                    try:
+                        model, tokenizer = load_tiny_model()
+                        st.session_state.model = model
+                        st.session_state.tokenizer = tokenizer
+                        st.session_state.models_loaded = True
+                        st.success("✅ Tiny model loaded successfully!")
+                    except Exception as e2:
+                        st.error(f"All models failed to load: {str(e2)}")
             
-            with st.spinner("Processing PDFs..."):
-                # Process PDFs
-                pdf_documents, pdf_names = process_pdfs(uploaded_files)
-                st.session_state.pdf_names = pdf_names
-                
-                if pdf_documents:
-                    # Create chunks
-                    st.session_state.pdf_chunks = create_chunks(pdf_documents, pdf_names)
+            if st.session_state.models_loaded:
+                with st.spinner("Processing PDFs..."):
+                    # Process PDFs
+                    pdf_documents, pdf_names = process_pdfs(uploaded_files)
+                    st.session_state.pdf_names = pdf_names
                     
-                    # Create FAISS index
-                    st.session_state.faiss_index = create_faiss_index(
-                        st.session_state.pdf_chunks, 
-                        st.session_state.embedder
-                    )
-                    
-                    st.session_state.processing_complete = True
-                    st.success(f"✅ Processed {len(pdf_documents)} PDFs")
-                    st.success(f"✅ Created {len(st.session_state.pdf_chunks)} knowledge chunks")
-                    st.rerun()
-                else:
-                    st.error("No valid PDFs could be processed")
+                    if pdf_documents:
+                        # Create chunks
+                        st.session_state.pdf_chunks = create_chunks(pdf_documents, pdf_names)
+                        
+                        # Create FAISS index
+                        st.session_state.faiss_index = create_faiss_index(
+                            st.session_state.pdf_chunks, 
+                            st.session_state.embedder
+                        )
+                        
+                        st.session_state.processing_complete = True
+                        st.success(f"✅ Processed {len(pdf_documents)} PDFs")
+                        st.success(f"✅ Created {len(st.session_state.pdf_chunks)} knowledge chunks")
+                        st.rerun()
+                    else:
+                        st.error("No valid PDFs could be processed")
     
     # Display stats
     if st.session_state.pdf_chunks:
@@ -448,6 +510,8 @@ with st.sidebar:
             st.session_state.pdf_names = []
             st.session_state.processing_complete = False
             st.session_state.models_loaded = False
+            # Clear cache
+            st.cache_resource.clear()
             st.rerun()
 
 # Main chat interface
@@ -484,9 +548,7 @@ if st.session_state.pdf_chunks and st.session_state.model and st.session_state.e
                     user_question,
                     answer,
                     context,
-                    st.session_state.embedder,
-                    st.session_state.faiss_index,
-                    st.session_state.pdf_chunks
+                    st.session_state.embedder
                 )
             
             # Add to chat history
