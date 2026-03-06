@@ -7,44 +7,20 @@ numpy>=1.24.0
 pandas>=2.0.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
-
-# PDF processing
 PyMuPDF>=1.23.0
-
-# Model fine-tuning and optimization
 peft>=0.6.0
 bitsandbytes>=0.41.0
 trl>=0.7.0
 accelerate>=0.24.0
-
-# Evaluation metrics
 scikit-learn>=1.3.0
 rouge-score>=0.1.2
 nltk>=3.8.1
 bert-score>=0.3.13
 evaluate>=0.4.0
 datasets>=2.14.0
-
-# Text splitting and LangChain ecosystem
 langchain>=0.1.0
 langchain-community>=0.1.0
 langchain-text-splitters>=0.1.0
-
-# Utilities
 tqdm>=4.66.0
-ipywidgets>=8.1.0
-jupyter>=1.0.0
-IPython>=8.14.0
-pickle5>=0.0.11
-json5>=0.9.14
-
-# Google Colab specific (optional, comment out if not using Colab)
-google-colab>=1.0.0
-
-# Additional utilities
-warnings  # Built-in, no version needed
-gc  # Built-in, no version needed
-re  # Built-in, no version needed
-datetime  # Built-in, no version needed
-pathlib  # Built-in, no version needed
-shutil  # Built-in, no version needed
+streamlit>=1.28.0
+plotly>=5.17.0
