@@ -16,6 +16,37 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
 import warnings
+import streamlit as st
+
+# MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Autism Research Chatbot",
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Add this to prevent automatic processing
+import os
+import sys
+
+# Check if this is the first run and there are PDFs in the directory
+if 'pdf_chunks' not in st.session_state:
+    st.session_state.pdf_chunks = []
+if 'faiss_index' not in st.session_state:
+    st.session_state.faiss_index = None
+if 'embedder' not in st.session_state:
+    st.session_state.embedder = None
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'tokenizer' not in st.session_state:
+    st.session_state.tokenizer = None
+if 'pdf_names' not in st.session_state:
+    st.session_state.pdf_names = []
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
+if 'models_loaded' not in st.session_state:
+    st.session_state.models_loaded = False
 warnings.filterwarnings('ignore')
 
 # Set page config FIRST (must be the first Streamlit command)
